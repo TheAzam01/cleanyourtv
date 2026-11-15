@@ -132,6 +132,19 @@ public class MatchParserTest {
         assertEquals("POSTPONED", matches.get(3).status);
     }
 
+    @Test public void parsesSportScoreTimestampsWithExplicitUtcOffset() throws Exception {
+        String response = """
+                {"matches":[{"time":"2026-11-22T14:00:00+00:00","status":"upcoming",
+                  "home":"Hull City","away":"Brighton Hove Albion"}]}
+                """;
+
+        List<Match> matches = MatchParser.parseSportScore(response, LocalDate.of(2026, 11, 22), DUBAI);
+
+        assertEquals(1, matches.size());
+        assertEquals("Hull City", matches.get(0).home.name);
+        assertEquals("Brighton Hove Albion", matches.get(0).away.name);
+    }
+
     @Test public void sportScoreLocalDateIncludesBothDubaiUtcDatesAndFiltersNeighbors() throws Exception {
         String response = """
                 {"matches":[

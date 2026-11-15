@@ -6,6 +6,7 @@ import org.json.JSONObject;
 
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -144,7 +145,11 @@ final class MatchParser {
         try {
             return Instant.parse(value);
         } catch (RuntimeException ignored) {
-            return null;
+            try {
+                return OffsetDateTime.parse(value).toInstant();
+            } catch (RuntimeException invalidTimestamp) {
+                return null;
+            }
         }
     }
 }
