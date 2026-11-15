@@ -23,6 +23,8 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.content.Intent;
+import android.net.Uri;
 
 import java.time.Instant;
 import java.time.LocalDate;
@@ -44,14 +46,16 @@ public final class MatchDayActivity extends Activity {
     private static final int TEXT = Color.rgb(246, 247, 249);
     private static final int MUTED = Color.rgb(157, 165, 177);
     private final Handler main = new Handler(Looper.getMainLooper());
-    private final ExecutorService apiExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService coordinatorExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService apiExecutor = Executors.newFixedThreadPool(Competition.values().length);
     private final ExecutorService crestExecutor = Executors.newFixedThreadPool(3);
     private final MatchRepository repository = new MatchRepository();
     private CrestLoader crestLoader;
 
     private ZoneId zone;
     private LocalDate selectedDate;
-    private long requestSerial;
+    private MatchLoadState activeLoad;
+    private MatchLoadState manualLoad;
     private int crestSerial;
     private int crestsPending;
     private int crestsFailed;
@@ -72,9 +76,10 @@ public final class MatchDayActivity extends Activity {
     private TextView emptyText;
     private final EnumMap<Competition, MatchRepository.Result> currentResults =
             new EnumMap<>(Competition.class);
-    private String baseFooter = "Scores may be delayed · football-data.org";
+    private String baseFooter = "Fixtures and scores · Powered by SportScore";
     private String baseFooterDetail = "";
     private boolean manualRefreshInFlight;
+    private static final String PROVIDER_KEY = "data_provider";
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
@@ -100,6 +105,7 @@ public final class MatchDayActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        coordinatorExecutor.shutdownNow();
         apiExecutor.shutdownNow();
         crestExecutor.shutdownNow();
         super.onDestroy();
@@ -117,7 +123,9 @@ public final class MatchDayActivity extends Activity {
         top.setGravity(Gravity.CENTER_VERTICAL);
         TextView brand = text("MATCH DAY", 27, TEXT, true);
         top.addView(brand, new LinearLayout.LayoutParams(0, dp(52), 1));
-        TextView sourceTag = text("FOOTBALL SCORES  ·  DELAYED", 14, MUTED, true);
+        DataProvider provider = selectedProvider();
+        TextView sourceTag = text(provider == DataProvider.SPORT_SCORE
+                ? "FOOTBALL SCORES  ·  SPORTSCORE" : "FOOTBALL SCORES  ·  DELAYED", 14, MUTED, true);
         sourceTag.setGravity(Gravity.CENTER_VERTICAL);
         top.addView(sourceTag, new LinearLayout.LayoutParams(0, dp(52), 1));
         refreshButton = actionButton("Refresh", () -> requestMatches(true, false));
@@ -173,7 +181,7 @@ public final class MatchDayActivity extends Activity {
         root.addView(matchScroll, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
 
-        footerText = text("Scores may be delayed · football-data.org", 13, MUTED, false);
+        footerText = text(defaultFooter(), 13, MUTED, false);
         footerText.setGravity(Gravity.CENTER_VERTICAL);
         footerDetail = text("", 12, MUTED, false);
         footerDetail.setGravity(Gravity.CENTER_VERTICAL);
@@ -182,7 +190,9 @@ public final class MatchDayActivity extends Activity {
         setContentView(root);
 
         updateDateControls();
-        if (!currentResults.isEmpty()) displayResults(currentResults, false);
+        if (!currentResults.isEmpty()) {
+            displayResults(currentResults, false, activeLoad != null && !activeLoad.isComplete());
+        }
         else showEmptyMessage("Loading saved schedules…");
     }
 
@@ -204,7 +214,10 @@ public final class MatchDayActivity extends Activity {
         header.addView(title, titleParams);
         root.addView(header, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(64)));
 
-        TextView description = text("Enter your football-data.org API key to load fixtures and delayed scores for the included competitions.",
+        DataProvider provider = selectedProvider();
+        TextView description = text(provider == DataProvider.SPORT_SCORE
+                        ? "Choose a fixture source. SportScore is ready to use without an API key."
+                        : "Enter your football-data.org API key to load fixtures and delayed scores for the included competitions.",
                 18, MUTED, false);
         description.setGravity(Gravity.CENTER_VERTICAL);
         description.setMaxLines(2);
@@ -212,55 +225,88 @@ public final class MatchDayActivity extends Activity {
         descParams.topMargin = dp(34);
         root.addView(description, descParams);
 
-        EditText keyField = new EditText(this);
-        keyField.setSingleLine(true);
-        keyField.setTextSize(20);
-        keyField.setTextColor(TEXT);
-        keyField.setHintTextColor(MUTED);
-        keyField.setHint("API key");
-        keyField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
-        keyField.setPadding(dp(18), 0, dp(18), 0);
-        keyField.setBackground(background(PANEL, dp(10), Color.TRANSPARENT));
-        keyField.setText(getPreferences(Context.MODE_PRIVATE).getString("api_key", ""));
-        LinearLayout.LayoutParams fieldParams = new LinearLayout.LayoutParams(dp(700), dp(62));
-        fieldParams.topMargin = dp(10);
-        root.addView(keyField, fieldParams);
+        LinearLayout providerRow = new LinearLayout(this);
+        providerRow.setGravity(Gravity.CENTER_VERTICAL);
+        TextView sportScore = actionButton(provider == DataProvider.SPORT_SCORE
+                ? "✓  SportScore · Recommended" : "SportScore · Recommended", () -> selectProvider(DataProvider.SPORT_SCORE));
+        providerRow.addView(sportScore, buttonParams(dp(310), dp(54)));
+        TextView footballData = actionButton(provider == DataProvider.FOOTBALL_DATA
+                ? "✓  football-data.org" : "football-data.org", () -> selectProvider(DataProvider.FOOTBALL_DATA));
+        LinearLayout.LayoutParams footballParams = buttonParams(dp(280), dp(54));
+        footballParams.leftMargin = dp(14);
+        providerRow.addView(footballData, footballParams);
+        LinearLayout.LayoutParams providerParams = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(60));
+        providerParams.topMargin = dp(10);
+        root.addView(providerRow, providerParams);
 
-        TextView privacy = text("The key stays in this app's private storage. Requests go only to football-data.org; no account details or analytics are sent.",
-                15, MUTED, false);
-        privacy.setMaxLines(2);
-        LinearLayout.LayoutParams privacyParams = new LinearLayout.LayoutParams(dp(780), dp(52));
-        privacyParams.topMargin = dp(14);
-        root.addView(privacy, privacyParams);
+        EditText keyField = null;
+        if (provider == DataProvider.FOOTBALL_DATA) {
+            keyField = new EditText(this);
+            keyField.setSingleLine(true);
+            keyField.setTextSize(20);
+            keyField.setTextColor(TEXT);
+            keyField.setHintTextColor(MUTED);
+            keyField.setHint("API key");
+            keyField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
+            keyField.setPadding(dp(18), 0, dp(18), 0);
+            keyField.setBackground(background(PANEL, dp(10), Color.TRANSPARENT));
+            keyField.setText(getPreferences(Context.MODE_PRIVATE).getString("api_key", ""));
+            LinearLayout.LayoutParams fieldParams = new LinearLayout.LayoutParams(dp(700), dp(62));
+            fieldParams.topMargin = dp(10);
+            root.addView(keyField, fieldParams);
+
+            TextView privacy = text("The key stays in this app's private storage. Requests go only to football-data.org; no account details or analytics are sent.",
+                    15, MUTED, false);
+            privacy.setMaxLines(2);
+            LinearLayout.LayoutParams privacyParams = new LinearLayout.LayoutParams(dp(780), dp(52));
+            privacyParams.topMargin = dp(14);
+            root.addView(privacy, privacyParams);
+        }
 
         LinearLayout actions = new LinearLayout(this);
         actions.setGravity(Gravity.CENTER_VERTICAL);
-        TextView save = actionButton("Save key", () -> {
-            String value = keyField.getText().toString().trim();
-            getPreferences(Context.MODE_PRIVATE).edit().putString("api_key", value).apply();
-            Toast.makeText(this, "API key saved on this TV", Toast.LENGTH_SHORT).show();
-            returnToMatches();
-        });
-        actions.addView(save, buttonParams(dp(150), dp(54)));
-        TextView clear = actionButton("Clear key", () -> {
-            keyField.setText("");
-            getPreferences(Context.MODE_PRIVATE).edit().remove("api_key").apply();
-        });
-        LinearLayout.LayoutParams clearParams = buttonParams(dp(150), dp(54));
-        clearParams.leftMargin = dp(12);
-        actions.addView(clear, clearParams);
+        if (provider == DataProvider.FOOTBALL_DATA) {
+            EditText savedKeyField = keyField;
+            TextView save = actionButton("Save key", () -> {
+                String value = savedKeyField.getText().toString().trim();
+                getPreferences(Context.MODE_PRIVATE).edit().putString("api_key", value).apply();
+                Toast.makeText(this, "API key saved on this TV", Toast.LENGTH_SHORT).show();
+                returnToMatches();
+            });
+            actions.addView(save, buttonParams(dp(150), dp(54)));
+            TextView clear = actionButton("Clear key", () -> {
+                savedKeyField.setText("");
+                getPreferences(Context.MODE_PRIVATE).edit().remove("api_key").apply();
+            });
+            LinearLayout.LayoutParams clearParams = buttonParams(dp(150), dp(54));
+            clearParams.leftMargin = dp(12);
+            actions.addView(clear, clearParams);
+        } else {
+            TextView done = actionButton("Done", this::returnToMatches);
+            actions.addView(done, buttonParams(dp(150), dp(54)));
+        }
         LinearLayout.LayoutParams actionsParams = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(64));
         actionsParams.topMargin = dp(22);
         root.addView(actions, actionsParams);
 
-        TextView source = text("Included: Premier League, Champions League, La Liga, Serie A, Bundesliga and Ligue 1. Free scores are delayed; 10 API calls per minute.",
+        TextView source = text("Included: Premier League, Champions League, La Liga, Serie A, Bundesliga and Ligue 1. Free scores are delayed; refresh is limited to one batch per minute.",
                 14, MUTED, false);
         source.setMaxLines(2);
         LinearLayout.LayoutParams sourceParams = new LinearLayout.LayoutParams(dp(800), dp(48));
         sourceParams.topMargin = dp(20);
         root.addView(source, sourceParams);
         setContentView(root);
-        keyField.requestFocus();
+        if (keyField != null) keyField.requestFocus(); else sportScore.requestFocus();
+    }
+
+    private void selectProvider(DataProvider provider) {
+        getPreferences(Context.MODE_PRIVATE).edit().putString(PROVIDER_KEY, provider.preferenceValue).apply();
+        showSettingsScreen();
+    }
+
+    private DataProvider selectedProvider() {
+        return DataProvider.fromPreference(getPreferences(Context.MODE_PRIVATE).getString(
+                PROVIDER_KEY, DataProvider.SPORT_SCORE.preferenceValue));
     }
 
     private void returnToMatches() {
@@ -275,9 +321,10 @@ public final class MatchDayActivity extends Activity {
         crestSerial++;
         crestsPending = 0;
         crestsFailed = 0;
-        baseFooter = "Scores may be delayed · football-data.org";
+        baseFooter = defaultFooter();
         baseFooterDetail = "";
         updateDateControls();
+        if (matchScroll != null) matchScroll.scrollTo(0, 0);
         showEmptyMessage("Loading schedules…");
         updateFooter();
         requestMatches(false, true);
@@ -289,47 +336,82 @@ public final class MatchDayActivity extends Activity {
 
     private void requestMatches(boolean manualRefresh, boolean resetScroll) {
         if (manualRefresh && manualRefreshInFlight) return;
+        final LocalDate requestedDate = selectedDate;
+        final MatchLoadState load = new MatchLoadState(requestedDate);
+        activeLoad = load;
+        if (resetScroll && matchScroll != null) matchScroll.scrollTo(0, 0);
         if (manualRefresh) {
             manualRefreshInFlight = true;
+            manualLoad = load;
             if (refreshButton != null) refreshButton.setText("Refreshing…");
         }
-        final LocalDate requestedDate = selectedDate;
         final String key = getPreferences(Context.MODE_PRIVATE).getString("api_key", "");
-        final long serial = ++requestSerial;
+        final DataProvider provider = selectedProvider();
         if (currentResults.isEmpty() || matchList == null) {
             showEmptyMessage(manualRefresh ? "Refreshing league schedules…" : "Loading schedules…");
         }
         if (footerText != null && currentResults.isEmpty()) {
             footerText.setText(manualRefresh ? "Refreshing schedules…" : "Loading league schedules…");
         }
-        apiExecutor.execute(() -> {
-            EnumMap<Competition, MatchRepository.Result> results = new EnumMap<>(Competition.class);
-            for (Competition competition : Competition.values()) {
-                if (!manualRefresh) {
-                    MatchRepository.Result saved = repository.readCached(this, requestedDate, zone, competition);
-                    if (saved != null) {
-                        results.put(competition, saved);
-                        continue;
-                    }
-                }
-                results.put(competition,
-                        repository.refresh(this, key, requestedDate, zone, competition));
+        coordinatorExecutor.execute(() -> loadSchedules(load, key, provider, manualRefresh));
+    }
+
+    private void loadSchedules(MatchLoadState load, String key, DataProvider provider, boolean manualRefresh) {
+        EnumMap<Competition, MatchRepository.Result> cached = new EnumMap<>(Competition.class);
+        List<Competition> fetch = new ArrayList<>();
+        for (Competition competition : Competition.values()) {
+            MatchRepository.Result saved = repository.readCached(this, load.date, zone, competition, provider);
+            cached.put(competition, saved);
+            if (manualRefresh || saved == null) {
+                fetch.add(competition);
+            } else {
+                postResult(load, competition, saved);
             }
-            main.post(() -> {
-                if (manualRefresh) {
-                    manualRefreshInFlight = false;
-                    if (refreshButton != null) refreshButton.setText("Refresh");
-                }
-                if (isFinishing() || serial != requestSerial || !requestedDate.equals(selectedDate)
-                        || settingsOpen) return;
-                currentResults.clear();
-                currentResults.putAll(results);
-                displayResults(results, resetScroll);
-            });
+        }
+
+        if (fetch.isEmpty()) return;
+        if (provider == DataProvider.FOOTBALL_DATA && (key == null || key.trim().isEmpty())) {
+            for (Competition competition : fetch) {
+                postResult(load, competition,
+                        repository.refresh(this, key, load.date, zone, competition, provider));
+            }
+            return;
+        }
+        if (!repository.tryStartNetworkBatch(this)) {
+            long remaining = repository.networkCooldownRemaining(this);
+            String message = "Wait " + Math.max(1L, (remaining + 999L) / 1000L)
+                    + "s before the next refresh.";
+            for (Competition competition : fetch) {
+                MatchRepository.Result saved = cached.get(competition);
+                postResult(load, competition, saved == null
+                        ? MatchRepository.Result.failure(message) : saved.withError(message));
+            }
+            return;
+        }
+        for (Competition competition : fetch) {
+            apiExecutor.execute(() -> postResult(load, competition,
+                    repository.refresh(this, key, load.date, zone, competition, provider)));
+        }
+    }
+
+    private void postResult(MatchLoadState load, Competition competition,
+                            MatchRepository.Result result) {
+        main.post(() -> {
+            boolean visible = load == activeLoad;
+            boolean accepted = load.accept(selectedDate, competition, result);
+            if (load == manualLoad && load.isComplete()) {
+                manualLoad = null;
+                manualRefreshInFlight = false;
+                if (refreshButton != null) refreshButton.setText("Refresh");
+            }
+            if (!accepted || !visible || isFinishing() || settingsOpen) return;
+            currentResults.put(competition, result);
+            updateCompetitionResult(competition, result, !load.isComplete());
         });
     }
 
-    private void displayResults(Map<Competition, MatchRepository.Result> results, boolean resetScroll) {
+    private void displayResults(Map<Competition, MatchRepository.Result> results,
+                               boolean resetScroll, boolean pending) {
         if (matchList == null) return;
         int scrollY = resetScroll || matchScroll == null ? 0 : matchScroll.getScrollY();
         matchList.removeAllViews();
@@ -344,17 +426,60 @@ public final class MatchDayActivity extends Activity {
             LinearLayout.LayoutParams sectionParams = new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             sectionParams.bottomMargin = dp(16);
-            matchList.addView(competitionCard(competition, result.matches), sectionParams);
+            View card = competitionCard(competition, result.matches);
+            card.setTag(competition);
+            matchList.addView(card, sectionParams);
         }
         if (matchCount == 0) {
-            showEmptyMessage(hasErrors(results)
-                    ? "No saved fixtures are available. Check the API key or choose Refresh."
-                    : "No matches on this day.");
+            showEmptyMessage(pending ? "Loading league schedules…" : emptyMessage(results));
         } else emptyText = null;
         if (matchScroll != null) matchScroll.post(() -> matchScroll.scrollTo(0, scrollY));
         baseFooter = footerFor(results);
         baseFooterDetail = footerDetailFor(results);
         updateFooter();
+    }
+
+    private void updateCompetitionResult(Competition competition, MatchRepository.Result result,
+                                         boolean pending) {
+        if (matchList == null) return;
+        for (int i = matchList.getChildCount() - 1; i >= 0; i--) {
+            View child = matchList.getChildAt(i);
+            if (child.getTag() == competition) matchList.removeViewAt(i);
+        }
+        if (emptyText != null) {
+            matchList.removeView(emptyText);
+            emptyText = null;
+        }
+        if (!result.matches.isEmpty()) {
+            View card = competitionCard(competition, result.matches);
+            card.setTag(competition);
+            int index = 0;
+            while (index < matchList.getChildCount()) {
+                Object tag = matchList.getChildAt(index).getTag();
+                if (tag instanceof Competition && ((Competition) tag).ordinal() > competition.ordinal()) break;
+                index++;
+            }
+            LinearLayout.LayoutParams sectionParams = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            sectionParams.bottomMargin = dp(16);
+            matchList.addView(card, index, sectionParams);
+        }
+        int matchCount = 0;
+        for (MatchRepository.Result value : currentResults.values()) matchCount += value.matches.size();
+        if (matchCount == 0) {
+            showEmptyMessage(pending ? "Loading league schedules…" : emptyMessage(currentResults));
+        }
+        baseFooter = footerFor(currentResults);
+        baseFooterDetail = footerDetailFor(currentResults);
+        updateFooter();
+    }
+
+    private String emptyMessage(Map<Competition, MatchRepository.Result> results) {
+        return hasErrors(results)
+                ? (selectedProvider() == DataProvider.FOOTBALL_DATA
+                    ? "No saved fixtures are available. Check the API key or choose Refresh."
+                    : "No saved fixtures are available. Choose Refresh to try SportScore again.")
+                : "No matches on this day.";
     }
 
     private View competitionCard(Competition competition, List<Match> matches) {
@@ -494,6 +619,11 @@ public final class MatchDayActivity extends Activity {
     private void updateFooter() {
         if (footerText == null || footerDetail == null) return;
         footerText.setText(baseFooter);
+        boolean sportScore = selectedProvider() == DataProvider.SPORT_SCORE;
+        footerText.setClickable(sportScore);
+        footerText.setFocusable(sportScore);
+        footerText.setOnClickListener(sportScore ? view -> startActivity(new Intent(Intent.ACTION_VIEW,
+                Uri.parse("https://sportscore.com/"))) : null);
         if (crestsPending > 0) {
             footerDetail.setText("Loading team crests · " + crestsPending + " remaining");
         } else if (crestsFailed > 0) {
@@ -522,7 +652,7 @@ public final class MatchDayActivity extends Activity {
             if (firstError == null) firstError = result.error;
             else if (!firstError.equals(result.error)) errorsMatch = false;
         }
-        if (failures == 0) return "Scores may be delayed · football-data.org";
+        if (failures == 0) return defaultFooter();
         if (failures == 1) return "Schedule update failed · " + firstError;
         if (errorsMatch) return firstError + (savedScheduleAvailable ? " · saved schedules kept" : "");
         if (savedScheduleAvailable) return "Some league schedules could not update · saved results were kept";
@@ -538,6 +668,12 @@ public final class MatchDayActivity extends Activity {
         }
         if (latestUpdate == 0) return "";
         return (allSaved ? "Saved schedules · " : "Schedules updated · ") + updateTime(latestUpdate);
+    }
+
+    private String defaultFooter() {
+        return selectedProvider() == DataProvider.SPORT_SCORE
+                ? "Fixtures and scores · Powered by SportScore"
+                : "Scores may be delayed · football-data.org";
     }
 
     private void updateDateControls() {
